@@ -6,8 +6,7 @@
 # * Installs & configures Docker Engine
 # * Installs kubelet / kubeadm / kubectl (specified version)
 # * Installs cri‑dockerd from **pre‑built release tarball** (no Go toolchain)
-# -----------------------------------------------------------------------------
-#   Tested on fresh Debian 12 VM – kernel 6.1 – systemd 252
+# * NEW: waits gracefully for any existing apt/dpkg operations to finish
 # -----------------------------------------------------------------------------
 set -euo pipefail
 
@@ -17,6 +16,7 @@ CRI_DOCKERD_VERSION="v0.3.1"        # Tested, stable tag that works w/ Docker 2
 DOCKER_BASE_POOL="172.31.0.0/16"    # Base for Docker address‑pools
 DOCKER_POOL_SIZE="24"               # Each subnet size within the pool
 DOCKER_BIP="172.7.0.1/16"           # Fixed bridge IP for docker0
+APT_LOCK_TIMEOUT=180                 # Seconds to wait for dpkg lock (3 min)
 # ──────────────────────────────────────────────────────────────────────────────
 
 K8S_MINOR="v$(echo "$K8S_VERSION" | awk -F. '{print $1"."$2}')"  # e.g. v1.28
@@ -30,7 +30,32 @@ case "$(uname -m)" in
 esac
 
 #───────────────────────────────────────────────────────────────────────────────
-# 1 ─ Disable swap (kubelet won’t start if swap is on)                         
+# Utility: wait until dpkg/apt locks are free, up to APT_LOCK_TIMEOUT seconds
+#───────────────────────────────────────────────────────────────────────────────
+wait_for_dpkg_lock() {
+  local start=$(date +%s)
+  while fuser /var/lib/dpkg/lock >/dev/null 2>&1 \
+        || fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 \
+        || fuser /var/lib/apt/lists/lock >/dev/null 2>&1 \
+        || fuser /var/cache/apt/archives/lock >/dev/null 2>&1; do
+    local now=$(date +%s)
+    if (( now - start > APT_LOCK_TIMEOUT )); then
+      echo "[✗] Timeout waiting for dpkg lock (>${APT_LOCK_TIMEOUT}s). Exiting." >&2
+      exit 1
+    fi
+    echo "[!] Another apt/dpkg process is running – waiting…" >&2
+    sleep 5
+  done
+}
+
+# Wrap apt‑get to always wait for the lock first
+apt_safe() {
+  wait_for_dpkg_lock
+  DEBIAN_FRONTEND=noninteractive apt-get "$@"
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# 1 ─ Disable swap                                                            
 #───────────────────────────────────────────────────────────────────────────────
 disable_swap() {
   echo "[*] Disabling swap…"
@@ -41,12 +66,12 @@ disable_swap() {
 }
 
 #───────────────────────────────────────────────────────────────────────────────
-# 2 ─ Install Docker Engine                                                    
+# 2 ─ Install Docker Engine                                                   
 #───────────────────────────────────────────────────────────────────────────────
 install_docker() {
   echo "[*] Installing Docker Engine…"
-  apt-get update -y
-  apt-get install -y ca-certificates curl gnupg lsb-release
+  apt_safe update -y
+  apt_safe install -y ca-certificates curl gnupg lsb-release
 
   install -d -m 0755 /etc/apt/keyrings
   curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg
@@ -56,8 +81,8 @@ install_docker() {
     https://download.docker.com/linux/debian $(lsb_release -cs) stable" \
     | tee /etc/apt/sources.list.d/docker.list >/dev/null
 
-  apt-get update -y
-  apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  apt_safe update -y
+  apt_safe install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 
   cat >/etc/docker/daemon.json <<EOF
 {
@@ -73,16 +98,15 @@ EOF
 }
 
 #───────────────────────────────────────────────────────────────────────────────
-# 3 ─ Install kubelet / kubeadm / kubectl                                      
+# 3 ─ Install kubelet / kubeadm / kubectl                                     
 #───────────────────────────────────────────────────────────────────────────────
 install_k8s_tools() {
   echo "[*] Installing Kubernetes tools (target ${K8S_VERSION})…"
-  apt-get update -y
-  apt-get install -y apt-transport-https ca-certificates curl gpg
+  apt_safe update -y
+  apt_safe install -y apt-transport-https ca-certificates curl gpg
 
   install -d -m 0755 /etc/apt/keyrings
 
-  # Prefer minor‑specific repo; fallback to generic stable.
   for REPO_BASE in \
     "https://pkgs.k8s.io/core:/stable:/${K8S_MINOR}/deb/" \
     "https://pkgs.k8s.io/core:/stable:/deb/"; do
@@ -94,17 +118,17 @@ install_k8s_tools() {
     fi
   done
 
-  apt-get update -y
-  if ! apt-get install -y kubelet="${K8S_VERSION}-1.1" kubeadm="${K8S_VERSION}-1.1" kubectl="${K8S_VERSION}-1.1"; then
+  apt_safe update -y
+  if ! apt_safe install -y kubelet="${K8S_VERSION}-1.1" kubeadm="${K8S_VERSION}-1.1" kubectl="${K8S_VERSION}-1.1"; then
     echo "[!] Exact patch not found; installing repo default for ${K8S_MINOR}."
-    apt-get install -y kubelet kubeadm kubectl
+    apt_safe install -y kubelet kubeadm kubectl
   fi
   apt-mark hold kubelet kubeadm kubectl
   echo "[*] kubelet, kubeadm, kubectl installed."
 }
 
 #───────────────────────────────────────────────────────────────────────────────
-# 4 ─ Install cri‑dockerd from **pre‑built tarball**                           
+# 4 ─ Install cri‑dockerd from pre‑built tarball                              
 #───────────────────────────────────────────────────────────────────────────────
 install_cri_dockerd() {
   echo "[*] Installing cri-dockerd ${CRI_DOCKERD_VERSION} (${CRI_ARCH}) …"
@@ -117,7 +141,6 @@ install_cri_dockerd() {
   tar -xzf "${TMP_DIR}/${TAR_NAME}" -C "${TMP_DIR}"
   install -o root -g root -m 0755 "${TMP_DIR}/cri-dockerd" /usr/local/bin/
 
-  # Install systemd units
   for UNIT in cri-docker.service cri-docker.socket; do
     curl -fsSL -o "/etc/systemd/system/${UNIT}" \
       "https://raw.githubusercontent.com/Mirantis/cri-dockerd/${CRI_DOCKERD_VERSION}/packaging/systemd/${UNIT}"
@@ -127,11 +150,8 @@ install_cri_dockerd() {
   systemctl daemon-reload
   systemctl enable --now cri-docker.service
 
-  if systemctl is-active --quiet cri-docker.service; then
-    echo "[*] cri-dockerd active."
-  else
-    echo "[✗] cri-dockerd failed to start"; exit 1
-  fi
+  systemctl is-active --quiet cri-docker.service && echo "[*] cri-dockerd active." \
+    || { echo "[✗] cri-dockerd failed to start"; exit 1; }
 }
 
 #───────────────────────────────────────────────────────────────────────────────
