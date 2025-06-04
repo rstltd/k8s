@@ -1,27 +1,29 @@
 #!/usr/bin/env bash
 # setup-k8s-debian.sh - Provision a Debian 12 (Bookworm) host for Kubernetes
-#
+# -----------------------------------------------------------------------------
 # * Disables swap (required by kubelet)
 # * Installs & configures Docker Engine + cri-dockerd runtime shim
 # * Installs kubeadm / kubelet / kubectl (pinned to the chosen version)
-#
-# Tested on: Debian 12 (kernel 6.1+) with systemd 252+
 # -----------------------------------------------------------------------------
+# Tested on: Debian 12 (kernel 6.1+) with systemd 252+
 set -euo pipefail
 
-# --- Adjustable variables ----------------------------------------------------
-K8S_VERSION="1.28.0"                # Kubernetes version (x.y.z)
-DOCKER_BASE_POOL="172.31.0.0/16"   # Default docker bridge address pool base
-DOCKER_POOL_SIZE="24"              # Size of each address pool subnet
+# ------------------------------ Variables ------------------------------------
+K8S_VERSION="1.28.0"                # Full Kubernetes version you want on the node
+DOCKER_BASE_POOL="172.31.0.0/16"   # Docker bridge address‑pool base
+DOCKER_POOL_SIZE="24"              # Size of each docker address‑pool subnet
 DOCKER_BIP="172.7.0.1/16"          # Fixed bridge IP for docker0
 # -----------------------------------------------------------------------------
+
+# Derive the minor version string (v1.28, v1.29 …) for the pkgs.k8s.io repo
+K8S_MINOR="v$(echo "$K8S_VERSION" | awk -F. '{print $1"."$2}')"
 
 # 1. Disable and remove swap (kubelet requirement)
 disable_swap() {
   echo "[*] Disabling swap..."
   sysctl -w vm.swappiness=0
   swapoff -a
-  if grep -qE "\sswap\s" /etc/fstab; then
+  if grep -qE "\\sswap\\s" /etc/fstab; then
     sed -i.bak '/ swap / s/^/#/' /etc/fstab
   fi
   echo "[*] Swap disabled."
@@ -35,10 +37,13 @@ install_docker() {
 
   # Add Docker’s official GPG key & repository for Debian 12
   install -m 0755 -d /etc/apt/keyrings
-  curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  curl -fsSL https://download.docker.com/linux/debian/gpg \
+    | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
   chmod a+r /etc/apt/keyrings/docker.gpg
 
-  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian $(lsb_release -cs) stable"     | tee /etc/apt/sources.list.d/docker.list > /dev/null
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+    https://download.docker.com/linux/debian $(lsb_release -cs) stable" \
+    | tee /etc/apt/sources.list.d/docker.list > /dev/null
 
   apt-get update -y
   apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
@@ -72,14 +77,20 @@ install_k8s_tools() {
   apt-get update -y
   apt-get install -y apt-transport-https ca-certificates curl gpg
 
-  # Add Kubernetes signing key & repository (Debian)
+  # Add Kubernetes signing key & repository (community‑owned, per minor version)
   install -m 0755 -d /etc/apt/keyrings
-  curl -fsSL https://pkgs.k8s.io/core:/stable:/v${K8S_VERSION}/deb/Release.key |     gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+  curl -fsSL https://pkgs.k8s.io/core:/stable:/${K8S_MINOR}/deb/Release.key \
+    | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
 
-  echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v${K8S_VERSION}/deb/ /"     | tee /etc/apt/sources.list.d/kubernetes.list > /dev/null
+  echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] \
+    https://pkgs.k8s.io/core:/stable:/${K8S_MINOR}/deb/ /" \
+    | tee /etc/apt/sources.list.d/kubernetes.list > /dev/null
 
   apt-get update -y
-  apt-get install -y kubelet kubeadm kubectl
+  # Install the exact patch version requested
+  apt-get install -y kubelet="${K8S_VERSION}-1.1" kubeadm="${K8S_VERSION}-1.1" kubectl="${K8S_VERSION}-1.1" || \
+  apt-get install -y kubelet kubeadm kubectl  # fallback to repo default if exact not found
+
   apt-mark hold kubelet kubeadm kubectl
   echo "[*] kubelet, kubeadm, kubectl installed and held."
 }
