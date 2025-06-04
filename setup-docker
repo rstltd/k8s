@@ -1,0 +1,31 @@
+#!/bin/bash
+
+set -e
+
+echo "🔄 更新套件列表..."
+sudo apt-get update
+
+echo "📦 安裝必要套件..."
+sudo apt-get install -y ca-certificates curl gnupg
+
+echo "🔐 新增 Docker 的官方 GPG 金鑰..."
+sudo install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/debian/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+sudo chmod a+r /etc/apt/keyrings/docker.gpg
+
+echo "➕ 新增 Docker APT 軟體源..."
+echo \
+  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian \
+  $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+echo "🔄 再次更新套件列表..."
+sudo apt-get update
+
+echo "🐳 安裝 Docker Engine、CLI 和 containerd..."
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+echo "✅ 驗證 Docker 是否安裝成功..."
+sudo docker run hello-world
+
+echo "🎉 Docker 安裝完成！"
