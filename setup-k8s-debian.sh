@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
-# -----------------------------------------------------------------------------
-# setup-k8s.sh – Provision a single Debian 12 (Bookworm) host for Kubernetes
-# -----------------------------------------------------------------------------
+# setup-k8s-debian.sh - Provision a Debian 12 (Bookworm) host for Kubernetes
+#
 # * Disables swap (required by kubelet)
-# * Installs & configures Docker Engine + cri‑dockerd runtime shim
+# * Installs & configures Docker Engine + cri-dockerd runtime shim
 # * Installs kubeadm / kubelet / kubectl (pinned to the chosen version)
-# -----------------------------------------------------------------------------
-# Tested on: Debian 12 (Bookworm) – kernel 6.1+ – systemd 252+
+#
+# Tested on: Debian 12 (kernel 6.1+) with systemd 252+
 # -----------------------------------------------------------------------------
 set -euo pipefail
 
@@ -22,7 +21,7 @@ disable_swap() {
   echo "[*] Disabling swap..."
   sysctl -w vm.swappiness=0
   swapoff -a
-  if grep -qE "\\sswap\\s" /etc/fstab; then
+  if grep -qE "\sswap\s" /etc/fstab; then
     sed -i.bak '/ swap / s/^/#/' /etc/fstab
   fi
   echo "[*] Swap disabled."
@@ -39,9 +38,7 @@ install_docker() {
   curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
   chmod a+r /etc/apt/keyrings/docker.gpg
 
-  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
-    https://download.docker.com/linux/debian $(lsb_release -cs) stable" \
-    | tee /etc/apt/sources.list.d/docker.list > /dev/null
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian $(lsb_release -cs) stable"     | tee /etc/apt/sources.list.d/docker.list > /dev/null
 
   apt-get update -y
   apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
@@ -77,12 +74,9 @@ install_k8s_tools() {
 
   # Add Kubernetes signing key & repository (Debian)
   install -m 0755 -d /etc/apt/keyrings
-  curl -fsSL https://pkgs.k8s.io/core:/stable:/v${K8S_VERSION}/deb/Release.key | \
-    gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+  curl -fsSL https://pkgs.k8s.io/core:/stable:/v${K8S_VERSION}/deb/Release.key |     gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
 
-  echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] \
-    https://pkgs.k8s.io/core:/stable:/v${K8S_VERSION}/deb/ /" \
-    | tee /etc/apt/sources.list.d/kubernetes.list > /dev/null
+  echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v${K8S_VERSION}/deb/ /"     | tee /etc/apt/sources.list.d/kubernetes.list > /dev/null
 
   apt-get update -y
   apt-get install -y kubelet kubeadm kubectl
@@ -90,7 +84,7 @@ install_k8s_tools() {
   echo "[*] kubelet, kubeadm, kubectl installed and held."
 }
 
-# 4. Build & install cri‑dockerd from source (for Docker as CRI)
+# 4. Build & install cri-dockerd from source (for using Docker as CRI)
 install_cri_dockerd() {
   echo "[*] Installing cri-dockerd runtime shim..."
   apt-get update -y
@@ -113,7 +107,7 @@ main() {
   install_docker
   install_k8s_tools
   install_cri_dockerd
-  echo "[+] All prerequisites completed! Now, on the control‑plane node, run:\n    sudo kubeadm init --pod-network-cidr=${DOCKER_BASE_POOL}\n  Then follow the output to join worker nodes with \"kubeadm join ...\""
+  echo "[+] All prerequisites completed! Now, on the control-plane node, run:\n    sudo kubeadm init --pod-network-cidr=${DOCKER_BASE_POOL}\n  Then use the generated join command on your worker nodes."
 }
 
 main "$@"
