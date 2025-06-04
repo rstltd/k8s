@@ -3,43 +3,41 @@
 # setup-k8s.sh – Provision a Debian 12 (Bookworm) host for Kubernetes
 # -----------------------------------------------------------------------------
 # * Disables swap (required by kubelet)
-# * Installs & configures Docker Engine + cri‑dockerd runtime shim
+# * Installs & configures Docker Engine + cri-dockerd runtime shim (pinned)
 # * Installs kubeadm / kubelet / kubectl (specific version or latest minor)
 # -----------------------------------------------------------------------------
-# Tested on: Debian 12 (kernel 6.1+) with systemd 252+
+# Tested on: Debian 12 (kernel 6.1+) with systemd 252+; Go 1.21 from Debian repos
 # -----------------------------------------------------------------------------
 set -euo pipefail
 
 # ----------------------------- TUNABLES --------------------------------------
-K8S_VERSION="1.28.0"                 # Exact version you want (x.y.z)
-DOCKER_BASE_POOL="172.31.0.0/16"    # Base pool for docker networks
-DOCKER_POOL_SIZE="24"               # Each automatically‑created subnet size
+K8S_VERSION="1.28.0"                 # Desired Kubernetes version X.Y.Z
+CRI_DOCKERD_VERSION="v0.3.1"        # Tag known to compile with Go ≤1.21
+DOCKER_BASE_POOL="172.31.0.0/16"    # Docker address‑pool base
+DOCKER_POOL_SIZE="24"               # Size of each docker subnet
 DOCKER_BIP="172.7.0.1/16"           # Fixed bridge IP for docker0
 # -----------------------------------------------------------------------------
 
-# Helper derived values
-K8S_MINOR="v$(echo "$K8S_VERSION" | awk -F. '{print $1"."$2}')"  # → v1.28
+# Helper – minor string (v1.28) for pkgs.k8s.io
+K8S_MINOR="v$(echo "$K8S_VERSION" | awk -F. '{print $1"."$2}')"
 
-# 1 – Disable swap (kubelet will refuse to start if swap is on)
+# 1 ─ Disable swap
 disable_swap() {
   echo "[*] Disabling swap…"
   sysctl -w vm.swappiness=0 > /dev/null
-  swapoff -a
-  if grep -qE "\\sswap\\s" /etc/fstab; then
-    sed -i.bak '/ swap / s/^/#/' /etc/fstab
-  fi
+  swapoff -a || true
+  grep -qE "\\sswap\\s" /etc/fstab && sed -i.bak '/ swap / s/^/#/' /etc/fstab || true
   echo "[*] Swap disabled."
 }
 
-# 2 – Install Docker Engine (CE) and configure bridge network
+# 2 ─ Install Docker Engine
 install_docker() {
-  echo "[*] Installing Docker Engine…"
+  echo "[*] Installing Docker Engine…"
   apt-get update -y
   apt-get install -y ca-certificates curl gnupg lsb-release
 
   install -d -m 0755 /etc/apt/keyrings
-  curl -fsSL https://download.docker.com/linux/debian/gpg \
-    | gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg
+  curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg
   chmod a+r /etc/apt/keyrings/docker.gpg
 
   echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
@@ -49,27 +47,20 @@ install_docker() {
   apt-get update -y
   apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 
-  # Docker daemon config
   cat >/etc/docker/daemon.json <<EOF
 {
   "log-driver": "json-file",
-  "log-opts": {
-    "tag": "{{.Name}}",
-    "max-size": "2m",
-    "max-file": "2"
-  },
-  "default-address-pools": [
-    { "base": "${DOCKER_BASE_POOL}", "size": ${DOCKER_POOL_SIZE} }
-  ],
+  "log-opts": {"tag": "{{.Name}}", "max-size": "2m", "max-file": "2"},
+  "default-address-pools": [ {"base": "${DOCKER_BASE_POOL}", "size": ${DOCKER_POOL_SIZE}} ],
   "bip": "${DOCKER_BIP}"
 }
 EOF
 
   systemctl enable --now docker
-  echo "[*] Docker installed and configured."
+  echo "[*] Docker installed."
 }
 
-# 3 – Add Kubernetes repository & install kubelet / kubeadm / kubectl
+# 3 ─ Install Kubernetes tools
 install_k8s_tools() {
   echo "[*] Installing Kubernetes tools (target ${K8S_VERSION})…"
   apt-get update -y
@@ -77,40 +68,37 @@ install_k8s_tools() {
 
   install -d -m 0755 /etc/apt/keyrings
 
-  # Attempt minor‑specific repo first (smaller metadata) → fall back to generic stable repo on 403/404.
   for REPO_BASE in \
     "https://pkgs.k8s.io/core:/stable:/${K8S_MINOR}/deb/" \
     "https://pkgs.k8s.io/core:/stable:/deb/"; do
-
-    if curl -fsSL "${REPO_BASE}Release.key" \
-         | gpg --dearmor --yes -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg; then
+    if curl -fsSL "${REPO_BASE}Release.key" | gpg --dearmor --yes -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg; then
       echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] ${REPO_BASE} /" \
         | tee /etc/apt/sources.list.d/kubernetes.list >/dev/null
       echo "[*] Using Kubernetes repo: ${REPO_BASE}"
       break
-    else
-      echo "[!] Repo ${REPO_BASE} unavailable (HTTP error), trying fallback…"
     fi
   done
 
   apt-get update -y
   if ! apt-get install -y kubelet="${K8S_VERSION}-1.1" kubeadm="${K8S_VERSION}-1.1" kubectl="${K8S_VERSION}-1.1"; then
-    echo "[!] Exact patch not found, installing default version of minor ${K8S_MINOR}."
+    echo "[!] Exact patch not found; installing repo default for ${K8S_MINOR}."
     apt-get install -y kubelet kubeadm kubectl
   fi
-
   apt-mark hold kubelet kubeadm kubectl
-  echo "[*] kubelet, kubeadm, kubectl installed and version‑held."
+  echo "[*] kubelet/kubeadm/kubectl installed."
 }
 
-# 4 – Build & enable cri-dockerd (so Docker can act as CRI)
+# 4 ─ Build & install cri-dockerd (pinned tag)
 install_cri_dockerd() {
-  echo "[*] Installing cri‑dockerd…"
+  echo "[*] Installing cri-dockerd ${CRI_DOCKERD_VERSION}…"
   apt-get update -y
   apt-get install -y git make golang-go
 
-  git clone --depth 1 https://github.com/Mirantis/cri-dockerd.git /tmp/cri-dockerd
+  git clone --depth 1 --branch "${CRI_DOCKERD_VERSION}" https://github.com/Mirantis/cri-dockerd.git /tmp/cri-dockerd
   pushd /tmp/cri-dockerd >/dev/null
+    # Work‑around: strip any third component in go.mod (e.g. 1.23.7 → 1.23)
+    sed -i -E 's/^go ([0-9]+\.[0-9]+)\.[0-9]+/go \1/' go.mod
+
     make cri-dockerd
     install -o root -g root -m 0755 cri-dockerd /usr/local/bin/
     install -o root -g root -m 0644 packaging/systemd/cri-docker.service /etc/systemd/system/
@@ -119,7 +107,7 @@ install_cri_dockerd() {
     systemctl daemon-reload
     systemctl enable --now cri-docker.service
   popd >/dev/null
-  echo "[*] cri‑dockerd installed and running."
+  echo "[*] cri-dockerd installed and running."
 }
 
 main() {
@@ -127,7 +115,7 @@ main() {
   install_docker
   install_k8s_tools
   install_cri_dockerd
-  echo "[+] All set! Initialise control‑plane with:\n    kubeadm init --pod-network-cidr=${DOCKER_BASE_POOL}\nThen join worker nodes using the token that \"kubeadm init\" prints."
+  echo "[+] Setup finished! Initialise control‑plane with:\n    kubeadm init --pod-network-cidr=${DOCKER_BASE_POOL}\nThen run the join command on workers."
 }
 
 main "$@"
