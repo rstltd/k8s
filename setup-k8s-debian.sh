@@ -6,22 +6,22 @@
 # * Installs & configures Docker Engine + cri-dockerd runtime shim (pinned)
 # * Installs kubeadm / kubelet / kubectl (specific version or latest minor)
 # -----------------------------------------------------------------------------
-# Tested on: Debian 12 (kernel 6.1+) with systemd 252+; Go 1.21 from Debian repos
+# Tested on: Debian 12 (kernel 6.1+) with systemd 252; Go 1.19 (default repo)
 # -----------------------------------------------------------------------------
 set -euo pipefail
 
 # ----------------------------- TUNABLES --------------------------------------
 K8S_VERSION="1.28.0"                 # Desired Kubernetes version X.Y.Z
-CRI_DOCKERD_VERSION="v0.3.1"        # Tag known to compile with Go ≤1.21
+CRI_DOCKERD_VERSION="v0.3.1"        # Stable tag that builds under Go 1.19+
 DOCKER_BASE_POOL="172.31.0.0/16"    # Docker address‑pool base
 DOCKER_POOL_SIZE="24"               # Size of each docker subnet
 DOCKER_BIP="172.7.0.1/16"           # Fixed bridge IP for docker0
 # -----------------------------------------------------------------------------
 
-# Helper – minor string (v1.28) for pkgs.k8s.io
+# Helper – Kubernetes minor string (e.g. v1.28) for pkgs.k8s.io
 K8S_MINOR="v$(echo "$K8S_VERSION" | awk -F. '{print $1"."$2}')"
 
-# 1 ─ Disable swap
+# 1 ─ Disable swap (required by kubelet)
 disable_swap() {
   echo "[*] Disabling swap…"
   sysctl -w vm.swappiness=0 > /dev/null
@@ -68,6 +68,7 @@ install_k8s_tools() {
 
   install -d -m 0755 /etc/apt/keyrings
 
+  # Try minor‑specific repo first; fallback to generic stable if inaccessible.
   for REPO_BASE in \
     "https://pkgs.k8s.io/core:/stable:/${K8S_MINOR}/deb/" \
     "https://pkgs.k8s.io/core:/stable:/deb/"; do
@@ -88,16 +89,21 @@ install_k8s_tools() {
   echo "[*] kubelet/kubeadm/kubectl installed."
 }
 
-# 4 ─ Build & install cri-dockerd (pinned tag)
+# 4 ─ Build & install cri-dockerd (handles Docker↔CRI)
 install_cri_dockerd() {
   echo "[*] Installing cri-dockerd ${CRI_DOCKERD_VERSION}…"
   apt-get update -y
   apt-get install -y git make golang-go
 
+  # Clean previous build dir if present to avoid git clone errors
+  rm -rf /tmp/cri-dockerd
+
   git clone --depth 1 --branch "${CRI_DOCKERD_VERSION}" https://github.com/Mirantis/cri-dockerd.git /tmp/cri-dockerd
   pushd /tmp/cri-dockerd >/dev/null
-    # Work‑around: strip any third component in go.mod (e.g. 1.23.7 → 1.23)
-    sed -i -E 's/^go ([0-9]+\.[0-9]+)\.[0-9]+/go \1/' go.mod
+
+    # Ensure go.mod directive matches installed Go toolchain (avoid version mismatch)
+    GO_MAJ_MIN=$(go version | awk '{print $3}' | sed 's/go//;s/\.[0-9]*$//')
+    sed -i -E "s/^go .*/go ${GO_MAJ_MIN}/" go.mod
 
     make cri-dockerd
     install -o root -g root -m 0755 cri-dockerd /usr/local/bin/
